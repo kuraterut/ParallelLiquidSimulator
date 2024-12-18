@@ -470,6 +470,7 @@ tuple<typename CommonTypeFixed<VType, VFType>::type, bool, pair<int, int>> Fluid
             }
             // assert(v >= velocity_flow.get(x, y, dx, dy));
             auto vp = min(lim, cap - flow);
+            if (vp < 0.001) continue;
             if ((*last_use)[nx][ny] == UT - 1) {
                 velocity_flow.add(x, y, dx, dy, vp);
                 (*last_use)[x][y] = UT;
