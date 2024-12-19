@@ -13,7 +13,9 @@ ARGS=(
     '--file=tests/data_heavy.in'
     '--savefile=saves/file1.out'
     '--ticks=1000'
+    '--threads_num=8'
 )
+
 TYPES='DOUBLE,FLOAT,FAST_FIXED(32, 16)'
 SIZES='S(14, 5),S(10, 10),S(32, 80)'
 

@@ -19,16 +19,17 @@ struct Simulator {
     bool need_save;
     string save_filename;
     size_t ticks;
+    int threads;
 
     template<typename P_TYPE, typename V_TYPE, typename V_FLOW_TYPE>
     void execute() {
-        Fluid<P_TYPE, V_TYPE, V_FLOW_TYPE> fluid(filename, need_save, save_filename);
-        auto start_time = std::chrono::system_clock::now();
-        fluid.run(ticks);
-        auto end_time = std::chrono::system_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::duration<double>>(end_time - start_time);
+        Fluid<P_TYPE, V_TYPE, V_FLOW_TYPE> fluid(filename, need_save, save_filename, ticks, threads);
+        auto start_time = chrono::system_clock::now();
+        fluid.run();
+        auto end_time   = chrono::system_clock::now();
+        double duration = chrono::duration_cast<chrono::duration<double>>(end_time - start_time).count();
 
-        std::cout << "\n" << ticks << " тиков за " << duration.count() << " секунд"<< std::endl;
+        cout << "\n" << ticks << " тиков за " << duration << " секунд"<< endl;
     }
 };
 

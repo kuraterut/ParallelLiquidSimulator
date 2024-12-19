@@ -5,6 +5,7 @@
 #include "Matrix.hpp"
 #include "VectorField.hpp"
 #include "Const.hpp"
+#include "ThreadPool.hpp"
 
 #include <cstring>
 #include <cassert>
@@ -19,6 +20,11 @@
 
 using namespace std;
 
+bool save_signal;
+
+void saveSignalOn(int _) {
+    save_signal = true;
+}
 
 template<typename PType, typename VType>
 class ParticleParams;
@@ -46,13 +52,17 @@ class Fluid {
 
         bool need_save;
         string save_filename;
-        // bool save_signal;
+
+        size_t ticks;
+        int threads;
+
+        ThreadPool threadPool;
 
 
     public:
-        Fluid(const string& filename, bool need_save, const string& save_filename);
+        Fluid(const string& filename, bool need_save, const string& save_filename, size_t ticks, int threads);
 
-        void run(size_t ticks); 
+        void run(); 
 
     private:
         tuple<V_COMMON_TYPE, bool, pair<int, int>> propagate_flow(int x, int y, V_COMMON_TYPE lim);
@@ -64,7 +74,6 @@ class Fluid {
         bool propagate_move(int x, int y, bool is_first);
 
     private:
-        // void saveSignalOn(int _);
         void save_to_file(size_t tick);
         
         void save_field(const AbstractMatrix<char>& field, ofstream& file);
@@ -91,17 +100,183 @@ class Fluid {
         void read_default_file(ifstream& fin);
         void read_save_file(ifstream& fin);
         void read_main_data_from_savefile(ifstream& fin);
-        
+
+
+        // void apply_external_forces(size_t x, size_t y);
+        void apply_external_forces_parallel();
+        void apply_external_forces_from_P_parallel();
+        void recalculate_P_with_keenetic_energy_parallel();
+
+        template<typename F>
+        void execute_parallel(const F& f);
+
     friend ParticleParams<PType, VType>;
 };
 
 
+template<typename PType, typename VType, typename VFType>
+template<typename F>
+void Fluid<PType, VType, VFType>::execute_parallel(const F& f) {
+    for (size_t help = 0; help < 3; ++help) {
+        for (size_t x = help; x < n; x += 3) {
+            threadPool.add_task([this, &f, x]{
+                for (size_t y = 0; y < m; ++y) {
+                    f(x, y);
+                }
+            });
+        }
+        threadPool.wait_all();
+    }
+}
+
+// template<typename PType, typename VType, typename VFType>
+// void Fluid<PType, VType, VFType>::apply_external_forces(size_t x, size_t y){
+//     if ((*field)[x][y] == '#')
+//         return;
+//     if ((*field)[x + 1][y] != '#')
+//         velocity.add(x, y, 1, 0, g);
+// }
+
+template<typename PType, typename VType, typename VFType>
+void Fluid<PType, VType, VFType>::apply_external_forces_parallel(){
+    // function<void(size_t, size_t)> func = 
+    execute_parallel([this](size_t x, size_t y) {
+        if ((*field)[x][y] == '#')
+            return;
+        if ((*field)[x + 1][y] != '#')
+            velocity.add(x, y, 1, 0, g);
+    });
+}
 
 
+template<typename PType, typename VType, typename VFType>
+void Fluid<PType, VType, VFType>::apply_external_forces_from_P_parallel(){
+    // function<void(size_t, size_t)> func = 
+    execute_parallel([this](size_t x, size_t y) -> void {
+        if ((*field)[x][y] == '#')
+            return;
+        for (auto [dx, dy] : deltas) {
+            int nx = x + dx, ny = y + dy;
+            if ((*field)[nx][ny] != '#' && (*old_p)[nx][ny] < (*old_p)[x][y]) {
+                auto delta_p = (*old_p)[x][y] - (*old_p)[nx][ny];
+                auto force = delta_p;
+                auto &contr = velocity.get(nx, ny, -dx, -dy);
+                if (contr * rho[(int) ((*field)[nx][ny])] >= force) {
+                    contr -= force / rho[(int) ((*field)[nx][ny])];
+                    continue;
+                }
+                force -= contr * rho[(int) ((*field)[nx][ny])];
+                contr = 0;
+                velocity.add(x, y, dx, dy, force / rho[(int) ((*field)[x][y])]);
+                (*p)[x][y] -= force / (*dirs)[x][y];
+            }
+        }
+  });
+}
+
+template<typename PType, typename VType, typename VFType>
+void Fluid<PType, VType, VFType>::recalculate_P_with_keenetic_energy_parallel(){
+    // function<void(size_t, size_t)> func = 
+    execute_parallel([this](size_t x, size_t y) -> void {
+        if ((*field)[x][y] == '#')
+            return;
+        for (auto [dx, dy] : deltas) {
+            auto old_v = velocity.get(x, y, dx, dy);
+            auto new_v = velocity_flow.get(x, y, dx, dy);
+            if (old_v > 0) {
+                assert(new_v <= old_v);
+                velocity.get(x, y, dx, dy) = new_v;
+                auto force = (old_v - new_v) * rho[(int) ((*field)[x][y])];
+                if ((*field)[x][y] == '.')
+                    force *= 0.8;
+                if ((*field)[x + dx][y + dy] == '#') {
+                    (*p)[x][y] += force / (*dirs)[x][y];
+                } else {
+                    (*p)[x + dx][y + dy] += force / (*dirs)[x + dx][y + dy];
+                }
+            }
+        }
+  });
+}
 
 
+template<typename PType, typename VType, typename VFType>
+void Fluid<PType, VType, VFType>::run(){
+    if(need_save){
+        signal(SIGINT, saveSignalOn);
+    }
+    save_signal = false;
 
+    for (size_t x = 0; x < n; ++x) {
+        for (size_t y = 0; y < m; ++y) {
+            if ((*field)[x][y] == '#')
+                continue;
+            for (auto [dx, dy] : deltas) {
+                (*dirs)[x][y] += ((*field)[x + dx][y + dy] != '#');
+            }
+        }
+    }
 
+    for (size_t i = start_tick; i < ticks; ++i) {
+        if(save_signal){
+            save_to_file(i);
+            cout << "SAAAAAVED" << endl;
+            save_signal = false;
+            cout << "Enter 0 to finish simulation and other key to continue: ";
+            string ans;
+            cin >> ans;
+            if(ans == "0") return;    
+        }
+        // Apply external forces
+        apply_external_forces_parallel();
+        // Apply forces from p
+        *old_p = *p;
+        apply_external_forces_from_P_parallel();
+
+        // Make flow from velocities
+        velocity_flow.reset();
+        bool prop = false;
+        do {
+            UT += 2;
+            prop = 0;
+            for (size_t x = 0; x < n; ++x) {
+                for (size_t y = 0; y < m; ++y) {
+                    if ((*field)[x][y] != '#' && (*last_use)[x][y] != UT) {
+                        auto [t, local_prop, _] = propagate_flow(x, y, 1);
+                        if (t > 0) {
+                            prop = 1;
+                        }
+                    }
+                }
+            }
+        } while (prop);
+
+        // Recalculate p with kinetic energy
+        recalculate_P_with_keenetic_energy_parallel();
+
+        UT += 2;
+        prop = false;
+        for (size_t x = 0; x < n; ++x) {
+            for (size_t y = 0; y < m; ++y) {
+                if ((*field)[x][y] != '#' && (*last_use)[x][y] != UT) {
+                    if (Rnd::random01<double>() < move_prob(x, y)) {
+                        prop = true;
+                        propagate_move(x, y, true);
+                    } else {
+                        propagate_stop(x, y, true);
+                    }
+                }
+            }
+        }
+
+        if (prop) {
+            cout << "Tick " << i << ":\n";
+            for (size_t x = 0; x < n; ++x) {
+                cout << (*field)[x] << endl;
+            }
+        }
+    }
+}
 
 
 template<typename PType, typename VType, typename VFType>
@@ -288,7 +463,7 @@ void Fluid<PType, VType, VFType>::read_default_file(ifstream& fin){
 
 
 template<typename PType, typename VType, typename VFType>
-Fluid<PType, VType, VFType>::Fluid(const string& filename, bool need_save, const string& save_filename) {
+Fluid<PType, VType, VFType>::Fluid(const string& filename, bool need_save, const string& save_filename, size_t ticks, int threads) : threadPool(threads) {
     ifstream fin(filename);
     if (!fin) {
         throw runtime_error("Не удалось открыть файл");
@@ -311,148 +486,15 @@ Fluid<PType, VType, VFType>::Fluid(const string& filename, bool need_save, const
 
     this->need_save = need_save;
     this->save_filename = save_filename;
+    if(ticks == 0) this->ticks = max_ticks;
+    else this->ticks = ticks;
+    this->threads = threads;
 }
 
-bool save_signal;
 
 
-void saveSignalOn(int _) {
-    save_signal = true;
-}
-
-template<typename PType, typename VType, typename VFType>
-void Fluid<PType, VType, VFType>::run(size_t ticks){
-    if(need_save){
-        signal(SIGINT, saveSignalOn);
-    }
-    save_signal = false;
-
-    for (size_t x = 0; x < n; ++x) {
-        for (size_t y = 0; y < m; ++y) {
-            if ((*field)[x][y] == '#')
-                continue;
-            for (auto [dx, dy] : deltas) {
-                (*dirs)[x][y] += ((*field)[x + dx][y + dy] != '#');
-            }
-        }
-    }
-    if(ticks == 0) ticks = max_ticks;
-    for (size_t i = start_tick; i < ticks; ++i) {
-        if(save_signal){
-            save_to_file(i);
-            cout << "SAAAAAVED" << endl;
-            save_signal = false;
-            cout << "Enter 0 to finish simulation and other key to continue: ";
-            string ans;
-            cin >> ans;
-            if(ans == "0") return;    
-        }
 
 
-        PType total_delta_p = 0;
-        // Apply external forces
-        for (size_t x = 0; x < n; ++x) {
-            for (size_t y = 0; y < m; ++y) {
-                if ((*field)[x][y] == '#')
-                    continue;
-                if ((*field)[x + 1][y] != '#')
-                    velocity.add(x, y, 1, 0, g);
-            }
-        }
-
-        // Apply forces from p
-        *old_p = *p;
-        for (size_t x = 0; x < n; ++x) {
-            for (size_t y = 0; y < m; ++y) {
-                if ((*field)[x][y] == '#')
-                    continue;
-                for (auto [dx, dy] : deltas) {
-                    int nx = x + dx, ny = y + dy;
-                    if ((*field)[nx][ny] != '#' && (*old_p)[nx][ny] < (*old_p)[x][y]) {
-                        auto delta_p = (*old_p)[x][y] - (*old_p)[nx][ny];
-                        auto force = delta_p;
-                        auto &contr = velocity.get(nx, ny, -dx, -dy);
-                        if (contr * rho[(int) ((*field)[nx][ny])] >= force) {
-                            contr -= force / rho[(int) ((*field)[nx][ny])];
-                            continue;
-                        }
-                        force -= contr * rho[(int) ((*field)[nx][ny])];
-                        contr = 0;
-                        velocity.add(x, y, dx, dy, force / rho[(int) ((*field)[x][y])]);
-                        (*p)[x][y] -= force / (*dirs)[x][y];
-                        total_delta_p -= force / (*dirs)[x][y];
-                    }
-                }
-            }
-        }
-
-        // Make flow from velocities
-        velocity_flow.reset();
-        bool prop = false;
-        do {
-            UT += 2;
-            prop = 0;
-            for (size_t x = 0; x < n; ++x) {
-                for (size_t y = 0; y < m; ++y) {
-                    if ((*field)[x][y] != '#' && (*last_use)[x][y] != UT) {
-                        auto [t, local_prop, _] = propagate_flow(x, y, 1);
-                        if (t > 0) {
-                            prop = 1;
-                        }
-                    }
-                }
-            }
-        } while (prop);
-
-        // Recalculate p with kinetic energy
-        for (size_t x = 0; x < n; ++x) {
-            for (size_t y = 0; y < m; ++y) {
-                if ((*field)[x][y] == '#')
-                    continue;
-                for (auto [dx, dy] : deltas) {
-                    auto old_v = velocity.get(x, y, dx, dy);
-                    auto new_v = velocity_flow.get(x, y, dx, dy);
-                    if (old_v > 0) {
-                        assert(new_v <= old_v);
-                        velocity.get(x, y, dx, dy) = new_v;
-                        auto force = (old_v - new_v) * rho[(int) ((*field)[x][y])];
-                        if ((*field)[x][y] == '.')
-                            force *= 0.8;
-                        if ((*field)[x + dx][y + dy] == '#') {
-                            (*p)[x][y] += force / (*dirs)[x][y];
-                            total_delta_p += force / (*dirs)[x][y];
-                        } else {
-                            (*p)[x + dx][y + dy] += force / (*dirs)[x + dx][y + dy];
-                            total_delta_p += force / (*dirs)[x + dx][y + dy];
-                        }
-                    }
-                }
-            }
-        }
-
-        UT += 2;
-        prop = false;
-        for (size_t x = 0; x < n; ++x) {
-            for (size_t y = 0; y < m; ++y) {
-                if ((*field)[x][y] != '#' && (*last_use)[x][y] != UT) {
-                    if (Rnd::random01<double>() < move_prob(x, y)) {
-                        prop = true;
-                        propagate_move(x, y, true);
-                    } else {
-                        propagate_stop(x, y, true);
-                    }
-                }
-            }
-        }
-
-        if (prop) {
-            cout << "Tick " << i << ":\n";
-            for (size_t x = 0; x < n; ++x) {
-                cout << (*field)[x] << endl;
-            }
-        }
-    }
-}
 
 
 
